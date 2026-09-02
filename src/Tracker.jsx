@@ -118,15 +118,7 @@ function parseRuDate(d) {
 }
 
 function flattenScheduleResponse(resp) {
-  const out = [];
-  ["numerator", "denominator"].forEach((key) => {
-    (resp[key] || []).forEach((day) => {
-      (day || []).forEach((lesson) => {
-        if (lesson && lesson.date && lesson.start_time) out.push(lesson);
-      });
-    });
-  });
-  return out;
+  return (resp.lessons || []).filter((l) => l && l.date && l.start_time && l.name);
 }
 
 const inputStyle = {
