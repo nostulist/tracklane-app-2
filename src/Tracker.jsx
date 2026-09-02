@@ -23,6 +23,7 @@ const MUTED_BG = "#211F24";
 const CATEGORIES = [
   { key: "sleep", label: "Сон", color: "#5B5566" },
   { key: "work", label: "Работа", color: "#7C838C" },
+  { key: "study", label: "Учёба", color: "#39C6FF" },
   { key: "sport", label: "Спорт", color: "#39FF6A" },
   { key: "chores", label: "Быт", color: "#8B8F7E" },
   { key: "rest", label: "Отдых", color: "#9D3DFF" },
@@ -62,7 +63,14 @@ const INCOME_CATEGORIES = [
   { key: "other_inc", label: "Прочее", color: "#6E6A63" },
 ];
 
-/* ---------- helpers ---------- */
+const emptyData = {
+  habits: [],
+  timeblocks: {},
+  workouts: [],
+  tasks: [],
+  transactions: [],
+  university: { groupId: "", lastSync: null },
+};
 
 function fmtDate(d) {
   const y = d.getFullYear();
@@ -103,7 +111,23 @@ function fmtMoney(n) {
   return new Intl.NumberFormat("ru-RU").format(Math.round(n));
 }
 
-const emptyData = { habits: [], timeblocks: {}, workouts: [], tasks: [], transactions: [] };
+function parseRuDate(d) {
+  // "6.11.2022" -> "2022-11-06"
+  const [day, month, year] = d.split(".").map(Number);
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function flattenScheduleResponse(resp) {
+  const out = [];
+  ["numerator", "denominator"].forEach((key) => {
+    (resp[key] || []).forEach((day) => {
+      (day || []).forEach((lesson) => {
+        if (lesson && lesson.date && lesson.start_time) out.push(lesson);
+      });
+    });
+  });
+  return out;
+}
 
 const inputStyle = {
   padding: "0.5rem 0.75rem",
@@ -166,6 +190,64 @@ export default function Tracker({ userId, userEmail, onSignOut }) {
   }, [data, loaded, userId]);
 
   const update = useCallback((fn) => setData((prev) => fn(prev)), []);
+
+  const [syncStatus, setSyncStatus] = useState("idle"); // idle | loading | done | error
+
+  const syncUniversitySchedule = useCallback(async (groupId) => {
+    if (!groupId) return;
+    setSyncStatus("loading");
+    try {
+      const res = await fetch(`/api/schedule?group=${encodeURIComponent(groupId)}`);
+      if (!res.ok) throw new Error("bad response");
+      const json = await res.json();
+      const lessons = flattenScheduleResponse(json);
+
+      const byDate = {};
+      lessons.forEach((l) => {
+        const date = parseRuDate(l.date);
+        if (!byDate[date]) byDate[date] = [];
+        const id = `univ-${date}-${l.start_time}-${l.name}`.replace(/\s+/g, "_");
+        byDate[date].push({
+          id,
+          category: "study",
+          start: l.start_time,
+          end: l.end_time,
+          subject: l.name,
+          room: l.classroom || "",
+          lecturer: l.lecturer || "",
+          source: "university",
+        });
+      });
+
+      update((prev) => {
+        const newBlocks = { ...prev.timeblocks };
+        Object.keys(byDate).forEach((date) => {
+          const manual = (newBlocks[date] || []).filter((b) => b.source !== "university");
+          newBlocks[date] = [...manual, ...byDate[date]];
+        });
+        return {
+          ...prev,
+          timeblocks: newBlocks,
+          university: { groupId, lastSync: new Date().toISOString() },
+        };
+      });
+      setSyncStatus("done");
+    } catch (e) {
+      console.error("Schedule sync failed", e);
+      setSyncStatus("error");
+    }
+  }, [update]);
+
+  // Автоматическая синхронизация: раз в сутки, без участия пользователя.
+  useEffect(() => {
+    if (!loaded) return;
+    const groupId = data.university?.groupId;
+    if (!groupId) return;
+    const last = data.university?.lastSync;
+    const stale = !last || Date.now() - new Date(last).getTime() > 20 * 60 * 60 * 1000;
+    if (stale) syncUniversitySchedule(groupId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   const urgentTasks = useMemo(
     () =>
@@ -275,7 +357,14 @@ export default function Tracker({ userId, userEmail, onSignOut }) {
 
         {tab === "menu" && <MenuTab data={data} goTo={setTab} />}
         {tab === "habits" && <HabitsTab data={data} update={update} />}
-        {tab === "time" && <TimeTab data={data} update={update} />}
+        {tab === "time" && (
+          <TimeTab
+            data={data}
+            update={update}
+            syncStatus={syncStatus}
+            syncUniversitySchedule={syncUniversitySchedule}
+          />
+        )}
         {tab === "training" && <TrainingTab data={data} update={update} />}
         {tab === "tasks" && (
           <TasksTab data={data} update={update} notifPermission={notifPermission} requestNotifications={requestNotifications} />
@@ -534,8 +623,11 @@ function DayLane({ blocks, height = 40 }) {
         const cat = CATEGORIES.find((c) => c.key === b.category);
         const left = (timeToMin(b.start) / 1440) * 100;
         const width = Math.max(((timeToMin(b.end) - timeToMin(b.start)) / 1440) * 100, 0.3);
+        const tooltip = b.source === "university"
+          ? `${b.subject}${b.room ? " · ауд. " + b.room : ""} ${b.start}–${b.end}`
+          : `${cat?.label} ${b.start}–${b.end}`;
         return (
-          <div key={b.id} title={`${cat?.label} ${b.start}–${b.end}`} className="absolute top-0 bottom-0"
+          <div key={b.id} title={tooltip} className="absolute top-0 bottom-0"
             style={{ left: `${left}%`, width: `${width}%`, backgroundColor: cat?.color || "#999" }} />
         );
       })}
@@ -543,11 +635,12 @@ function DayLane({ blocks, height = 40 }) {
   );
 }
 
-function TimeTab({ data, update }) {
+function TimeTab({ data, update, syncStatus, syncUniversitySchedule }) {
   const [date, setDate] = useState(todayStr());
   const [category, setCategory] = useState(CATEGORIES[1].key);
   const [start, setStart] = useState("09:00");
   const [end, setEnd] = useState("10:00");
+  const [groupInput, setGroupInput] = useState(data.university?.groupId || "");
 
   const blocks = data.timeblocks[date] || [];
 
@@ -608,6 +701,33 @@ function TimeTab({ data, update }) {
         )}
       </div>
 
+      <div className="rounded-xl p-4 mb-3 flex flex-wrap items-center gap-3" style={{ backgroundColor: PANEL, border: `1px solid ${BORDER}` }}>
+        <div className="flex flex-col gap-1">
+          <label className="text-xs" style={{ color: SUBTEXT }}>Номер группы</label>
+          <input
+            value={groupInput}
+            onChange={(e) => setGroupInput(e.target.value)}
+            placeholder="21307"
+            className="mono-font"
+            style={{ ...inputStyle, width: 100 }}
+          />
+        </div>
+        <button
+          onClick={() => syncUniversitySchedule(groupInput.trim())}
+          disabled={syncStatus === "loading" || !groupInput.trim()}
+          className="flex items-center gap-1 px-4 py-2 rounded-lg font-semibold self-end"
+          style={{ backgroundColor: "#39C6FF", color: "#0A1A20", opacity: syncStatus === "loading" ? 0.6 : 1 }}
+        >
+          {syncStatus === "loading" ? "Загрузка..." : "Загрузить расписание"}
+        </button>
+        <div className="text-xs self-end" style={{ color: syncStatus === "error" ? "#9D3DFF" : SUBTEXT }}>
+          {syncStatus === "error" && "Не удалось получить расписание — попробуй ещё раз."}
+          {syncStatus !== "error" && data.university?.lastSync &&
+            `Обновлено: ${new Date(data.university.lastSync).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}`}
+          {syncStatus !== "error" && !data.university?.lastSync && "Пары из университета появятся здесь после загрузки"}
+        </div>
+      </div>
+
       <div className="rounded-xl p-4 mb-3" style={{ backgroundColor: PANEL, border: `1px solid ${BORDER}` }}>
         <DayLane blocks={blocks} height={48} />
         <div className="flex justify-between mono-font text-xs mt-1" style={{ color: SUBTEXT }}>
@@ -659,8 +779,18 @@ function TimeTab({ data, update }) {
                 <div key={b.id} className="flex items-center gap-2 text-sm py-1">
                   <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: cat?.color }} />
                   <span className="mono-font">{b.start}–{b.end}</span>
-                  <span className="flex-1">{cat?.label}</span>
-                  <button onClick={() => deleteBlock(b.id)} style={{ color: SUBTEXT }} className="hover:text-[#9D3DFF]">
+                  <span className="flex-1 min-w-0">
+                    {b.source === "university" ? (
+                      <>
+                        <span className="font-semibold">{b.subject}</span>
+                        {b.room && <span style={{ color: SUBTEXT }}> · ауд. {b.room}</span>}
+                        {b.lecturer && <span style={{ color: SUBTEXT }}> · {b.lecturer}</span>}
+                      </>
+                    ) : (
+                      cat?.label
+                    )}
+                  </span>
+                  <button onClick={() => deleteBlock(b.id)} style={{ color: SUBTEXT }} className="hover:text-[#9D3DFF] shrink-0">
                     <Trash2 size={14} />
                   </button>
                 </div>
