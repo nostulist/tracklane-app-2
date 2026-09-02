@@ -64,13 +64,26 @@ async function fetchWeek(group, weekStart) {
 }
 
 export default async function handler(req, res) {
-  const { group } = req.query;
+  const { group, debug } = req.query;
   if (!group || typeof group !== "string") {
     return res.status(400).json({ error: "Параметр group обязателен" });
   }
 
   try {
     const monday = mondayOf(new Date());
+
+    if (debug) {
+      const url = `https://petrsu.ru/schedule/term?group=${encodeURIComponent(group)}&date=${fmtRuDate(monday)}`;
+      const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (personal schedule sync)" } });
+      const html = await r.text();
+      return res.status(200).json({
+        requestedUrl: url,
+        upstreamStatus: r.status,
+        htmlLength: html.length,
+        htmlSnippet: html.slice(0, 1500),
+      });
+    }
+
     const weekStarts = [0, 1, 2, 3].map((i) => {
       const d = new Date(monday);
       d.setDate(monday.getDate() + i * 7);
